@@ -2,38 +2,79 @@ var httpProxy = require("http-proxy");
 var http = require("http");
 var url = require("url");
 var net = require('net');
-var execSync = require('exec-sync');
+var execSync = require('sync-exec');
 
 // map of [host][port] -> tunneled port
 var tunnels = {}
 
+// Timeout for sync-exec.
+var timeout = 10000;
+
 // Start proxy server at this port, and continue
 // tunnels from the port number onwards.
-var startPort = 10000 // MODIFY
+var startPort = 10000
 
 // Name of the cluster.
 // You will connect to Cloudera Manager as
 // http://<cluster>:<port> or https://<cluster>:<port>
-var cluster = 'mycluster' // MODIFY
+var cluster;
+
+var ssh_userid;
 
 // Command to login to the machine where Cloudera Manager is running
 // without asking for password.
-var ssh = 'ssh' // MODIFY
+var ssh = 'ssh -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=10 -o Compression=no -o BatchMode=no'
 // ssh using a config file.
 // var ssh = 'ssh -F /my/config/file/cluster.config'
 
 // Name of the machines within the cluster
-var hostmap = { // MODIFY
-    "cdh1.cluster-internal": "cdh1",
-    "cdh2.cluster-internal": "cdh2",
-    "cdh3.cluster-internal": "cdh3",
-}
+var hostmap = {}
 
 // Host name of machine running Cloudera Manager.
-hostmap[cluster] = "cm-node" // MODIFY
+hostmap[cluster] = "0.0.0.0" // MODIFY
 
 // Command to kill all tunnels when you press Ctrl-C
-var killCommand = "kill -9 `ps -eaf | grep user | grep 'ssh ' | grep -v grep | grep '" + cluster + " -L' | awk '{print $2}'`"; // MODIFY
+function get_kill_command() {
+    return "kill -9 `ps -eaf | grep 'ssh ' | grep '" + cluster + " -L' | awk '{print $2}'`";
+}
+
+function usage() {
+    console.log("Usage: [-timeout <timeout for exec>] [-ssh <ssh command>] [-userid <userid to ssh>] [-hostmap hostname_or_ip:map] -proxy <port number to start proxy on> -gateway <hostname/IP of gateway machine>");
+    process.exit();
+}
+
+function parse_argv() {
+    for (var i = 2; i < process.argv.length; i++) {
+        if (process.argv[i] == "-timeout") {
+            timeout = parseInt(process.argv[++i]);
+        } else if (process.argv[i] == "-ssh") {
+            ssh = process.argv[++i];
+        } else if (process.argv[i] == "-proxy") {
+            startPort = parseInt(process.argv[++i]);
+        } else if (process.argv[i] == "-gateway") {
+            cluster = process.argv[++i];
+        } else if (process.argv[i] == "-userid") {
+            ssh_userid = process.argv[++i];
+        } else if (process.argv[i] == "-hostmap") {
+            map = process.argv[++i].split(':');
+            hostmap[map[0]] = map[1];
+        } else {
+            usage();
+        }
+    }
+
+    if (!cluster)
+        usage();
+}
+
+function get_ssh_command() {
+    var ssh_command = ssh + ' -Nf ';
+
+    if (ssh_userid)
+        ssh_command = ssh_command + ssh_userid + '@';
+
+    return ssh_command + cluster;
+}
 
 function get_tunnel(subhost, targetport, callback) {
     var targetHost = hostmap[subhost]
@@ -44,7 +85,8 @@ function get_tunnel(subhost, targetport, callback) {
 
     if (typeof tunnel === 'undefined') {
         tunnel = ++startPort
-        var sshCommand = ssh + ' ' + cluster + ' -L ' + tunnel + ':' + targetHost + ":" + targetport + ' -N -f'
+        var sshCommand = get_ssh_command() + ' -L ' + tunnel + ':' + targetHost + ":" + targetport;
+        // var sshCommand = ssh + ' ec2-user@' + cluster + ' -L ' + tunnel + ':' + targetHost + ":" + targetport + ' -Nf'
         exec(sshCommand, function (error) {
             tunnels[targetHost][targetport] = tunnel
             callback(tunnel)
@@ -57,9 +99,11 @@ function get_tunnel(subhost, targetport, callback) {
 // So the program does not close instantly.
 process.stdin.resume();
 
+parse_argv();
+
 // Exit handler, close all tunnels.
 function exitHandler (options, err) {
-    exec(killCommand, function (error) {
+    exec(get_kill_command(), function (error) {
         if (options.cleanup) console.log('cleanup');
         if (err) console.log(err.stack);
         if (options.exit) process.exit();
@@ -71,7 +115,8 @@ process.on('SIGINT', exitHandler.bind(null, {exit:true}));
 
 function exec (command, callback) {
     console.log("Executing: " + command)
-    execSync(command);
+    var log = execSync(command, timeout);
+    // console.log("Done executing, log is " + log)
     callback (false)
 }
 
@@ -104,6 +149,10 @@ function proxy_http(req, res, target) {
 
 var server = http.createServer(function (req, res) {
   var urlObj = url.parse(req.url);
+
+  // All access to AWS hosts goes though tunnel.
+  if (urlObj.hostname.startsWith("ec2") || urlObj.hostname.startsWith("ip-"))
+      hostmap[urlObj.hostname] = urlObj.hostname
 
   if (urlObj.hostname in hostmap) {
       get_tunnel(urlObj.hostname, urlObj.port, function (port) {
@@ -155,6 +204,10 @@ server.addListener('connect', function (req, socket, bodyhead) {
     var hostDomain = hostPort[0];
     var port = parseInt(hostPort[1]);
 
+    // All access to AWS hosts goes though tunnel.
+    if (hostDomain.startsWith("ec2") || hostDomain.startsWith("ip-"))
+        hostmap[hostDomain] = hostDomain
+
     if (hostDomain in hostmap) {
         get_tunnel(hostDomain, port, function (port) {
             console.log("Proxying HTTPS request for: " + req.url + " to localhost " + port);
@@ -164,3 +217,4 @@ server.addListener('connect', function (req, socket, bodyhead) {
         proxy_https(req, hostDomain, port, socket, bodyhead);
     }
 });
+
