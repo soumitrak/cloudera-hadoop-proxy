@@ -8,7 +8,7 @@ var execSync = require('sync-exec');
 var tunnels = {}
 
 // Timeout for sync-exec.
-var timeout = 10000;
+var timeout = 20000;
 
 // Start proxy server at this port, and continue
 // tunnels from the port number onwards.
@@ -30,9 +30,6 @@ var ssh = 'ssh -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountM
 // Name of the machines within the cluster
 var hostmap = {}
 
-// Host name of machine running Cloudera Manager.
-hostmap[cluster] = "0.0.0.0" // MODIFY
-
 // Command to kill all tunnels when you press Ctrl-C
 function get_kill_command() {
     return "kill -9 `ps -eaf | grep 'ssh ' | grep '" + cluster + " -L' | awk '{print $2}'`";
@@ -53,11 +50,13 @@ function parse_argv() {
             startPort = parseInt(process.argv[++i]);
         } else if (process.argv[i] == "-gateway") {
             cluster = process.argv[++i];
+            hostmap[cluster] = "0.0.0.0";
         } else if (process.argv[i] == "-userid") {
             ssh_userid = process.argv[++i];
         } else if (process.argv[i] == "-hostmap") {
             map = process.argv[++i].split(':');
             hostmap[map[0]] = map[1];
+            hostmap[map[1]] = map[1];
         } else {
             usage();
         }
@@ -150,8 +149,10 @@ function proxy_http(req, res, target) {
 var server = http.createServer(function (req, res) {
   var urlObj = url.parse(req.url);
 
+  // console.log("SK HTTP: hostname " + urlObj.hostname);
+
   // All access to AWS hosts goes though tunnel.
-  if (urlObj.hostname.startsWith("ec2") || urlObj.hostname.startsWith("ip-"))
+  if (!(urlObj.hostname in hostmap) && (urlObj.hostname.startsWith("ec2") || urlObj.hostname.startsWith("ip-")))
       hostmap[urlObj.hostname] = urlObj.hostname
 
   if (urlObj.hostname in hostmap) {
@@ -161,6 +162,7 @@ var server = http.createServer(function (req, res) {
           proxy_http(req, res, target);
       })
   } else {
+      console.log("Direct HTTP request for: " + urlObj.hostname + ":" + urlObj.port);
       var target = urlObj.protocol + "//" + urlObj.hostname + ":" + urlObj.port;
       proxy_http(req, res, target);
   }
@@ -204,8 +206,10 @@ server.addListener('connect', function (req, socket, bodyhead) {
     var hostDomain = hostPort[0];
     var port = parseInt(hostPort[1]);
 
+    // console.log("SK HTTPS: hostname " + hostDomain);
+
     // All access to AWS hosts goes though tunnel.
-    if (hostDomain.startsWith("ec2") || hostDomain.startsWith("ip-"))
+    if (!(hostDomain in hostmap) && (hostDomain.startsWith("ec2") || hostDomain.startsWith("ip-")))
         hostmap[hostDomain] = hostDomain
 
     if (hostDomain in hostmap) {
@@ -214,6 +218,7 @@ server.addListener('connect', function (req, socket, bodyhead) {
             proxy_https(req, "localhost", port, socket, bodyhead);
         })
     } else {
+        console.log("Direct HTTPS request for: " + req.url + ":" + port);
         proxy_https(req, hostDomain, port, socket, bodyhead);
     }
 });
